@@ -288,6 +288,11 @@ int fatx_fuse_read_dir(const char *path, void *buf, fuse_fill_dir_t filler, off_
 
         /* Get the next directory entry. */
         status = fatx_next_dir_entry(pd->fs, &dir);
+        if (status == FATX_STATUS_END_OF_DIR)
+        {
+            status = 0;
+            break;
+        }
         if (status != FATX_STATUS_SUCCESS) break;
     }
 
