@@ -104,6 +104,7 @@ int fatx_get_attr_dir(struct fatx_fs *fs, char const *start, struct fatx_dir *di
 
         /* Get the next directory entry. */
         status = fatx_next_dir_entry(fs, dir);
+        if (status == FATX_STATUS_END_OF_DIR) status = FATX_STATUS_FILE_NOT_FOUND;
         if (status != FATX_STATUS_SUCCESS) break;
     }
 

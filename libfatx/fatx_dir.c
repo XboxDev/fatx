@@ -121,7 +121,12 @@ int fatx_open_dir(struct fatx_fs *fs, char const *path, struct fatx_dir *dir)
 
             /* Get the next directory entry. */
             status = fatx_next_dir_entry(fs, dir);
-            if (status != FATX_STATUS_SUCCESS) break;
+            if (status == FATX_STATUS_END_OF_DIR)
+            {
+                fatx_error(fs, "path not found\n");
+                return FATX_STATUS_FILE_NOT_FOUND;
+            }
+            if (status != FATX_STATUS_SUCCESS) return FATX_STATUS_ERROR;
         }
     }
 
@@ -161,8 +166,12 @@ int fatx_next_dir_entry(struct fatx_fs *fs, struct fatx_dir *dir)
         return FATX_STATUS_SUCCESS;
 
     case FATX_CLUSTER_END:
-        fatx_error(fs, "got end of cluster before end of directory\n");
-        return FATX_STATUS_ERROR;
+        /* Every slot of the last cluster is in use, so the chain end is the
+         * end of the directory. Leave dir parked on the last entry.
+         */
+        dir->entry -= 1;
+        fatx_debug(fs, "directory ends exactly at the end of its last cluster\n");
+        return FATX_STATUS_END_OF_DIR;
 
     default:
         fatx_error(fs, "expected another cluster with additional directory entries\n");
@@ -302,6 +311,48 @@ int fatx_write_dir(struct fatx_fs *fs, struct fatx_dir *dir, struct fatx_dirent 
 }
 
 /*
+ * Append a cluster to a directory's chain. Every slot of the new cluster is
+ * initialized to the end-of-directory marker, as the Xbox does.
+ */
+static int fatx_grow_dir(struct fatx_fs *fs, size_t tail, size_t *new_cluster)
+{
+    uint8_t *chunk;
+    int status;
+
+    chunk = malloc(fs->bytes_per_cluster);
+    if (!chunk) return FATX_STATUS_ERROR;
+    memset(chunk, FATX_END_OF_DIR_MARKER, fs->bytes_per_cluster);
+
+    status = fatx_alloc_cluster(fs, new_cluster, false);
+    if (status)
+    {
+        free(chunk);
+        return status;
+    }
+
+    status = fatx_dev_seek_cluster(fs, *new_cluster, 0);
+    if (status == FATX_STATUS_SUCCESS &&
+        fatx_dev_write(fs, chunk, fs->bytes_per_cluster, 1) != 1)
+    {
+        status = FATX_STATUS_ERROR;
+    }
+    free(chunk);
+
+    if (status == FATX_STATUS_SUCCESS)
+    {
+        status = fatx_attach_cluster(fs, tail, *new_cluster);
+    }
+
+    /* Release the cluster if it could not be initialized or attached */
+    if (status)
+    {
+        fatx_free_cluster_chain(fs, *new_cluster);
+    }
+
+    return status;
+}
+
+/*
  * Allocate a directory entry
  * Sets dir->entry to the new entry
  */
@@ -309,75 +360,101 @@ int fatx_alloc_dir_entry(struct fatx_fs *fs, struct fatx_dir *dir)
 {
     struct fatx_dirent entry, *result;
     struct fatx_attr attr;
+    fatx_fat_entry fat_entry;
     int status;
-    size_t new_cluster, cur_cluster, cur_entry;
+    size_t new_cluster;
+    size_t entries_per_cluster = fs->bytes_per_cluster/sizeof(struct fatx_raw_directory_entry);
 
     fatx_debug(fs, "fatx_alloc_dir_entry()\n");
 
-    /* Scan directory entries for deleted files */
+    /* Scan directory entries for a deleted entry or the end-of-directory marker */
     dir->entry = 0;
     while (1)
     {
         status = fatx_read_dir(fs, dir, &entry, &attr, &result);
-        if (status == FATX_STATUS_SUCCESS)
-        {
-            fatx_debug(fs, "occupied entry at %d, continuing\n", dir->entry);
-            status = fatx_next_dir_entry(fs, dir);
-            if(status)
-            {
-                fatx_debug(fs, "out of entries to check, expanding directory\n");
-                break;
-            }
-        }
-        else if (status == FATX_STATUS_FILE_DELETED)
+        if (status == FATX_STATUS_FILE_DELETED)
         {
             fatx_debug(fs, "found deleted file at %d, suitable entry for allocation\n", dir->entry);
             return FATX_STATUS_SUCCESS;
         }
         else if (status == FATX_STATUS_END_OF_DIR)
         {
-            fatx_debug(fs, "end of dir, expanding directory\n");
             break;
         }
-        else
+        else if (status != FATX_STATUS_SUCCESS)
         {
             fatx_error(fs, "unable to read directory entry\n");
             return FATX_STATUS_ERROR;
         }
+
+        /* Occupied entry; step to the next one without leaving the chain. */
+        if (dir->entry + 1 < entries_per_cluster)
+        {
+            dir->entry += 1;
+            continue;
+        }
+
+        status = fatx_read_fat(fs, dir->cluster, &fat_entry);
+        if (status) return status;
+
+        switch (fatx_get_fat_entry_type(fs, fat_entry))
+        {
+        case FATX_CLUSTER_DATA:
+            dir->cluster = fat_entry;
+            dir->entry = 0;
+            continue;
+
+        case FATX_CLUSTER_END:
+            /* Every slot is in use and there is no end marker. The new entry
+             * becomes the first slot of a new cluster; the remaining slots of
+             * that cluster are end markers.
+             */
+            fatx_debug(fs, "directory full, expanding directory\n");
+            status = fatx_grow_dir(fs, dir->cluster, &new_cluster);
+            if (status) return status;
+            dir->cluster = new_cluster;
+            dir->entry = 0;
+            return FATX_STATUS_SUCCESS;
+
+        default:
+            fatx_error(fs, "expected another cluster with additional directory entries\n");
+            return FATX_STATUS_ERROR;
+        }
     }
 
-    /* If we have more space in the current cluster, then shift the end of file marker */
-    if (dir->entry < fs->bytes_per_cluster/sizeof(struct fatx_raw_directory_entry))
+    /* dir is on the end-of-directory marker, which becomes the new entry.
+     * Move the marker one slot forward.
+     */
+    if (dir->entry + 1 < entries_per_cluster)
     {
         dir->entry += 1;
         status = fatx_mark_end_of_dir(fs, dir);
-        if (status) return status;
-
-        /* Return to the newly freed entry */
         dir->entry -= 1;
-        return FATX_STATUS_SUCCESS;
+        return status;
     }
 
-    /* If all else fails, then allocate a new cluster */
-    status = fatx_alloc_cluster(fs, &new_cluster, true);
+    /* The marker is in the last slot of its cluster, so the next slot is the
+     * first one of the following cluster.
+     */
+    status = fatx_read_fat(fs, dir->cluster, &fat_entry);
     if (status) return status;
 
-    status = fatx_attach_cluster(fs, dir->cluster, new_cluster);
-    if (status) return status;
+    switch (fatx_get_fat_entry_type(fs, fat_entry))
+    {
+    case FATX_CLUSTER_DATA:
+    {
+        struct fatx_dir next = { .cluster = fat_entry, .entry = 0 };
+        return fatx_mark_end_of_dir(fs, &next);
+    }
 
-    /* Mark first element in new cluster as end of dir */
-    cur_cluster  = dir->cluster;
-    dir->cluster = new_cluster;
-    cur_entry    = dir->entry;
-    dir->entry   = 0;
+    case FATX_CLUSTER_END:
+        fatx_debug(fs, "end marker in last slot, expanding directory\n");
+        return fatx_grow_dir(fs, dir->cluster, &new_cluster);
 
-    status = fatx_mark_end_of_dir(fs, dir);
-    if (status) return status;
-
-    /* We should have one entry in the old cluster, so use it */
-    dir->cluster = cur_cluster;
-    dir->entry   = cur_entry;
-    return FATX_STATUS_SUCCESS;
+    default:
+        fatx_error(fs, "expected another cluster with additional directory entries\n");
+        return FATX_STATUS_ERROR;
+    }
 }
 
 /*
@@ -564,6 +641,7 @@ int fatx_unlink(struct fatx_fs *fs, char const *path)
 
         /* Seek to the directory entry. */
         status = fatx_next_dir_entry(fs, &dir);
+        if (status == FATX_STATUS_END_OF_DIR) status = FATX_STATUS_FILE_NOT_FOUND;
         if (status != FATX_STATUS_SUCCESS) break;
     }
 
@@ -656,6 +734,12 @@ int fatx_rmdir(struct fatx_fs *fs, char const *path)
         {
             /* Found deleted file, check next entry */
             status = fatx_next_dir_entry(fs, &dir);
+            if (status == FATX_STATUS_END_OF_DIR)
+            {
+                /* Only deleted entries; the directory is empty */
+                fatx_close_dir(fs, &dir);
+                break;
+            }
             if (status != FATX_STATUS_SUCCESS)
             {
                 fatx_error(fs, "failed to read next entry");
