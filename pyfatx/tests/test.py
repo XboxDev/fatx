@@ -446,5 +446,68 @@ class BasicTest(unittest.TestCase):
 		assert d2 == b1
 
 
+	@with_formatted_disk
+	def test_directory_grows_past_one_cluster(self, path):
+		fs = Fatx(path)
+
+		# Created back to back, so the directory cluster of /neighbor follows
+		# the first directory cluster of /big on disk.
+		fs.mkdir('/big')
+		fs.mkdir('/neighbor')
+
+		rng = random.Random()
+		rng.seed(12345)
+		canary = bytes([rng.getrandbits(8) for _ in range(1024)])
+		fs.write('/neighbor/canary', canary)
+
+		# 600 entries span three 16 KiB directory clusters (256 entries each)
+		count = 600
+		for i in range(count):
+			fs.write('/big/file{:04d}'.format(i), 'file {}'.format(i).encode())
+
+		names = sorted(a.filename for a in fs.listdir('/big'))
+		assert names == ['file{:04d}'.format(i) for i in range(count)]
+
+		for i in range(count):
+			assert fs.read('/big/file{:04d}'.format(i)) == 'file {}'.format(i).encode()
+
+		assert [a.filename for a in fs.listdir('/neighbor')] == ['canary']
+		assert fs.read('/neighbor/canary') == canary
+
+		# A freed slot in a later cluster is reused
+		fs.unlink('/big/file0500')
+		fs.write('/big/file0500', b'again')
+		assert fs.read('/big/file0500') == b'again'
+
+		for i in range(count):
+			fs.unlink('/big/file{:04d}'.format(i))
+		fs.rmdir('/big')
+
+
+	@with_formatted_disk
+	def test_directory_with_full_last_cluster(self, path):
+		fs = Fatx(path)
+		fs.mkdir('/full')
+
+		# Exactly one 16 KiB cluster worth of entries
+		count = 256
+		for i in range(count):
+			fs.write('/full/f{:03d}'.format(i), b'x')
+
+		assert len(list(fs.listdir('/full'))) == count
+
+		missing_found = False
+		try:
+			fs.get_attr('/full/missing')
+			missing_found = True
+		except AssertionError:
+			pass
+		assert not missing_found
+
+		fs.write('/full/one_more', b'y')
+		assert fs.read('/full/one_more') == b'y'
+		assert len(list(fs.listdir('/full'))) == count + 1
+
+
 if __name__ == '__main__':
 	unittest.main()
