@@ -470,7 +470,7 @@ int fatx_create_dirent(struct fatx_fs *fs, char const *path, struct fatx_dir *di
 
     /* Check basename is not too long */
     path_basename = fatx_basename(path);
-    if (strlen(path_basename) >= FATX_MAX_FILENAME_LEN)
+    if (strlen(path_basename) > FATX_MAX_FILENAME_LEN)
     {
         free(path_basename);
         fatx_error(fs, "filename is too long\n");
