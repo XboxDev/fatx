@@ -446,5 +446,31 @@ class BasicTest(unittest.TestCase):
 		assert d2 == b1
 
 
+	@with_formatted_disk
+	def test_filename_max_length(self, path):
+		fs = Fatx(path)
+
+		# 42 characters is the longest name a FATX directory entry holds
+		name42 = '/' + 'a' * 38 + '.bin'
+		fs.write(name42, b'42')
+		assert fs.read(name42) == b'42'
+		assert [a.filename for a in fs.listdir('/')] == [name42[1:]]
+
+		renamed42 = '/' + 'b' * 38 + '.bin'
+		fs.rename(name42, renamed42)
+		assert fs.read(renamed42) == b'42'
+
+		name43 = '/' + 'c' * 39 + '.bin'
+		created = False
+		try:
+			fs.write(name43, b'43')
+			created = True
+		except AssertionError:
+			pass
+		assert not created
+
+		fs.unlink(renamed42)
+
+
 if __name__ == '__main__':
 	unittest.main()
