@@ -567,5 +567,46 @@ class BasicTest(unittest.TestCase):
 		assert fs.read('/full/f000') == b'x'
 
 
+	@with_formatted_disk
+	def test_path_component_does_not_match_longer_sibling(self, path):
+		fs = Fatx(path)
+
+		# '/Game 2' is created first, so a lookup of the intermediate
+		# component 'Game/' that matched by prefix would resolve to it.
+		fs.mkdir('/Game 2')
+		fs.mkdir('/Game 2/video')
+		fs.write('/Game 2/video/a.txt', b'two')
+		fs.mkdir('/Game')
+		fs.mkdir('/Game/video')
+		fs.write('/Game/video/b.txt', b'one')
+
+		assert [a.filename for a in fs.listdir('/Game 2/video')] == ['a.txt']
+		assert [a.filename for a in fs.listdir('/Game/video')] == ['b.txt']
+		assert fs.read('/Game 2/video/a.txt') == b'two'
+		assert fs.read('/Game/video/b.txt') == b'one'
+
+
+	@with_formatted_disk
+	def test_path_component_prefix_is_not_found(self, path):
+		fs = Fatx(path)
+		fs.mkdir('/top')
+		fs.mkdir('/top/wolf')
+		fs.mkdir('/top/wolf/inner')
+		fs.write('/top/wolf/inner/x', b'x')
+
+		# Prefixes of an existing directory name, used as intermediate
+		# components, are not that directory
+		for missing in ('/top/w/inner/x', '/top/wol/inner/x'):
+			found = False
+			try:
+				fs.get_attr(missing)
+				found = True
+			except AssertionError:
+				pass
+			assert not found, missing
+
+		assert fs.read('/top/wolf/inner/x') == b'x'
+
+
 if __name__ == '__main__':
 	unittest.main()
